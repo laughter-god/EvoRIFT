@@ -1,0 +1,1061 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.modules.batchnorm import _BatchNorm
+from sklearn.cluster import KMeans
+import math
+import random
+
+class ViTill(nn.Module):
+    def __init__(
+            self,
+            encoder,
+            bottleneck,
+            decoder,
+            target_layers=[2, 3, 4, 5, 6, 7, 8, 9],
+            fuse_layer_encoder=[[0, 1, 2, 3, 4, 5, 6, 7]],
+            fuse_layer_decoder=[[0, 1, 2, 3, 4, 5, 6, 7]],
+            mask_neighbor_size=0,
+            remove_class_token=False,
+            encoder_require_grad_layer=[],
+    ) -> None:
+        super(ViTill, self).__init__()
+        self.encoder = encoder
+        self.bottleneck = bottleneck
+        self.decoder = decoder
+        self.target_layers = target_layers
+        self.fuse_layer_encoder = fuse_layer_encoder
+        self.fuse_layer_decoder = fuse_layer_decoder
+        self.remove_class_token = remove_class_token
+        self.encoder_require_grad_layer = encoder_require_grad_layer
+
+        if not hasattr(self.encoder, 'num_register_tokens'):
+            self.encoder.num_register_tokens = 0
+        self.mask_neighbor_size = mask_neighbor_size
+        
+        # 1. 检测是否为双分支网络 (保留你原有的逻辑)
+        self.is_dual_branch = hasattr(encoder, 'dual_branch_net')
+        
+        # 2. 检测是否为 SAM 网络 (我们在第一步里埋下的身份标识)
+        self.is_sam = getattr(encoder, 'is_sam', False)
+        embed_dim = 768 
+        ##
+        self.feature_diffusion = FeatureDiffusionAdapter(dim=embed_dim, kernel_size=5)
+        self.local_adapter = LocalAwareAdapter(dim=embed_dim, reduction=4)
+        self.defect_injector = RealDefectInjector(embed_dim=embed_dim, num_defects=10)
+
+        self.pde_layer = PDEEvolutionLayer(channels=embed_dim, dt=0.05, steps=3, source_weight=0.03)
+        self.latent_injector = PDEResidualBottleneck(self.pde_layer)
+    # 🌟 修改点 1：增加 label=None 参数
+    def forward(self, x):
+        if self.is_sam:
+            # 直接获取 SAM 的特征，SAM 已经吐出了 [B, H*W, 768] 的序列
+            en_features = self.encoder(x)
+            en_list = list(en_features) if isinstance(en_features, tuple) else [en_features]
+            
+            # 此时长度就是纯 H*W，不需要减 1
+            side = int(math.sqrt(en_list[0].shape[1]))
+            
+            x_fused = self.fuse_feature(en_list)
+            
+            # 💉 你的原始 Adapter 和咱们的高维注射器，完美在这里执行！
+            x_fused = self.local_adapter(x_fused, side, side)
+            #########
+            
+            # 🌟 修改点 2：把 label 传给数据投毒注射器，让它认准 screw (11)！
+            ##
+            x_fused = self.feature_diffusion(x_fused, side, side)
+            x_fused = self.defect_injector(x_fused)
+            
+            # 🌪️ 2. 引爆：让带毒的特征进入 PDE 演化引擎，引发能量崩塌！
+            x_fused= self.latent_injector(x_fused, side)
+            for i, blk in enumerate(self.bottleneck):
+                x_fused = blk(x_fused)
+
+            if self.mask_neighbor_size > 0:
+                attn_mask = self.generate_mask(side, x_fused.device)
+            else:
+                attn_mask = None
+
+            de_list = []
+            for i, blk in enumerate(self.decoder):
+                x_fused = blk(x_fused, attn_mask=attn_mask)
+                de_list.append(x_fused)
+            de_list = de_list[::-1]
+
+            # SAM 目前只取了一层特征，所以直接融合第 0 层
+            adjusted_fuse_encoder = [[0] for _ in self.fuse_layer_encoder]
+            
+            en = [self.fuse_feature([en_list[idx] for idx in idxs]) for idxs in adjusted_fuse_encoder]
+            de = [self.fuse_feature([de_list[idx] for idx in idxs]) for idxs in self.fuse_layer_decoder]
+
+            # 没有 class token，直接 Reshape 成特征图格式 [B, C, H, W]
+            en = [e.permute(0, 2, 1).reshape([e.shape[0], -1, side, side]).contiguous() for e in en]
+            de = [d.permute(0, 2, 1).reshape([d.shape[0], -1, side, side]).contiguous() for d in de]
+            
+            # 🌟 修复：直接返回上面处理好的、完美 2D 维度的 en 和 de！
+            return en, de
+        
+        # ==========================================
+        # 分支 C: 原始 DINOv2 / ViT 处理流程 (原作者的逻辑)
+        # ==========================================
+        else:
+            x = self.encoder.prepare_tokens(x)
+            en_list = []
+            for i, blk in enumerate(self.encoder.blocks):
+                if i <= self.target_layers[-1]:
+                    if i in self.encoder_require_grad_layer:
+                        x = blk(x)
+                    else:
+                        with torch.no_grad():
+                            x = blk(x)
+                else:
+                    continue
+                if i in self.target_layers:
+                    en_list.append(x)
+            side = int(math.sqrt(en_list[0].shape[1] - 1 - self.encoder.num_register_tokens))
+
+            if self.remove_class_token:
+                en_list = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en_list]
+
+            x = self.fuse_feature(en_list)
+            for i, blk in enumerate(self.bottleneck):
+                x = blk(x)
+
+            if self.mask_neighbor_size > 0:
+                attn_mask = self.generate_mask(side, x.device)
+            else:
+                attn_mask = None
+
+            de_list = []
+            for i, blk in enumerate(self.decoder):
+                x = blk(x, attn_mask=attn_mask)
+                de_list.append(x)
+            de_list = de_list[::-1]
+
+            en = [self.fuse_feature([en_list[idx] for idx in idxs]) for idxs in self.fuse_layer_encoder]
+            de = [self.fuse_feature([de_list[idx] for idx in idxs]) for idxs in self.fuse_layer_decoder]
+
+            if not self.remove_class_token:  
+                en = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en]
+                de = [d[:, 1 + self.encoder.num_register_tokens:, :] for d in de]
+
+            en = [e.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for e in en]
+            de = [d.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for d in de]
+            return en, de
+
+    def pde_residual_energy(self, x):
+        if not self.is_sam:
+            raise RuntimeError('pde_residual_energy is only supported for the SAM branch.')
+
+        en_features = self.encoder(x)
+        en_list = list(en_features) if isinstance(en_features, tuple) else [en_features]
+        side = int(math.sqrt(en_list[0].shape[1]))
+
+        x_fused = self.fuse_feature(en_list)
+        x_fused = self.local_adapter(x_fused, side, side)
+        x_fused = self.feature_diffusion(x_fused, side, side)
+        x_fused = self.defect_injector(x_fused)
+        return self.latent_injector.residual_energy(x_fused, side)
+
+    def pde_residual_metrics(self, x):
+        if not self.is_sam:
+            raise RuntimeError('pde_residual_metrics is only supported for the SAM branch.')
+
+        en_features = self.encoder(x)
+        en_list = list(en_features) if isinstance(en_features, tuple) else [en_features]
+        side = int(math.sqrt(en_list[0].shape[1]))
+
+        x_fused = self.fuse_feature(en_list)
+        x_fused = self.local_adapter(x_fused, side, side)
+        x_fused = self.feature_diffusion(x_fused, side, side)
+        x_fused = self.defect_injector(x_fused)
+        return self.latent_injector.residual_metrics(x_fused, side)
+
+    def pde_residual_map(self, x):
+        if not self.is_sam:
+            raise RuntimeError('pde_residual_map is only supported for the SAM branch.')
+
+        en_features = self.encoder(x)
+        en_list = list(en_features) if isinstance(en_features, tuple) else [en_features]
+        side = int(math.sqrt(en_list[0].shape[1]))
+
+        x_fused = self.fuse_feature(en_list)
+        x_fused = self.local_adapter(x_fused, side, side)
+        x_fused = self.feature_diffusion(x_fused, side, side)
+        x_fused = self.defect_injector(x_fused)
+        return self.latent_injector.residual_map(x_fused, side)
+
+    def fuse_feature(self, feat_list):
+        return torch.stack(feat_list, dim=1).mean(dim=1)
+
+    def generate_mask(self, feature_size, device='cuda'):
+        h, w = feature_size, feature_size
+        hm, wm = self.mask_neighbor_size, self.mask_neighbor_size
+        mask = torch.ones(h, w, h, w, device=device)
+        for idx_h1 in range(h):
+            for idx_w1 in range(w):
+                idx_h2_start = max(idx_h1 - hm // 2, 0)
+                idx_h2_end = min(idx_h1 + hm // 2 + 1, h)
+                idx_w2_start = max(idx_w1 - wm // 2, 0)
+                idx_w2_end = min(idx_w1 + wm // 2 + 1, w)
+                mask[
+                idx_h1, idx_w1, idx_h2_start:idx_h2_end, idx_w2_start:idx_w2_end
+                ] = 0
+        mask = mask.view(h * w, h * w)
+        
+        # SAM 维度特判：因为 SAM 没有 Class Token，直接返回 mask 即可
+        if self.is_sam:
+            return mask
+            
+        if self.remove_class_token:
+            return mask
+            
+        mask_all = torch.ones(h * w + 1 + self.encoder.num_register_tokens,
+                              h * w + 1 + self.encoder.num_register_tokens, device=device)
+        mask_all[1 + self.encoder.num_register_tokens:, 1 + self.encoder.num_register_tokens:] = mask
+        return mask_all
+    
+
+class ViTillCat(nn.Module):
+    def __init__(
+            self,
+            encoder,
+            bottleneck,
+            decoder,
+            target_layers=[2, 3, 4, 5, 6, 7, 8, 9],
+            fuse_layer_encoder=[1, 3, 5, 7],
+            mask_neighbor_size=0,
+            remove_class_token=False,
+            encoder_require_grad_layer=[],
+    ) -> None:
+        super(ViTillCat, self).__init__()
+        self.encoder = encoder
+        self.bottleneck = bottleneck
+        self.decoder = decoder
+        self.target_layers = target_layers
+        self.fuse_layer_encoder = fuse_layer_encoder
+        self.remove_class_token = remove_class_token
+        self.encoder_require_grad_layer = encoder_require_grad_layer
+
+        if not hasattr(self.encoder, 'num_register_tokens'):
+            self.encoder.num_register_tokens = 0
+        self.mask_neighbor_size = mask_neighbor_size
+
+    def forward(self, x):
+        x = self.encoder.prepare_tokens(x)
+        en_list = []
+        for i, blk in enumerate(self.encoder.blocks):
+            if i <= self.target_layers[-1]:
+                if i in self.encoder_require_grad_layer:
+                    x = blk(x)
+                else:
+                    with torch.no_grad():
+                        x = blk(x)
+            else:
+                continue
+            if i in self.target_layers:
+                en_list.append(x)
+        side = int(math.sqrt(en_list[0].shape[1] - 1 - self.encoder.num_register_tokens))
+
+        if self.remove_class_token:
+            en_list = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en_list]
+
+        x = self.fuse_feature(en_list)
+        for i, blk in enumerate(self.bottleneck):
+            x = blk(x)
+
+        for i, blk in enumerate(self.decoder):
+            x = blk(x)
+
+        en = [torch.cat([en_list[idx] for idx in self.fuse_layer_encoder], dim=2)]
+        de = [x]
+
+        if not self.remove_class_token:
+            en = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en]
+            de = [d[:, 1 + self.encoder.num_register_tokens:, :] for d in de]
+
+        en = [e.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for e in en]
+        de = [d.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for d in de]
+        return en, de
+
+    def fuse_feature(self, feat_list):
+        return torch.stack(feat_list, dim=1).mean(dim=1)
+
+
+class ViTAD(nn.Module):
+    def __init__(
+            self,
+            encoder,
+            bottleneck,
+            decoder,
+            target_layers=[2, 5, 8, 11],
+            fuse_layer_encoder=[0, 1, 2],
+            fuse_layer_decoder=[2, 5, 8],
+            mask_neighbor_size=0,
+            remove_class_token=False,
+    ) -> None:
+        super(ViTAD, self).__init__()
+        self.encoder = encoder
+        self.bottleneck = bottleneck
+        self.decoder = decoder
+        self.target_layers = target_layers
+        self.fuse_layer_encoder = fuse_layer_encoder
+        self.fuse_layer_decoder = fuse_layer_decoder
+        self.remove_class_token = remove_class_token
+
+        if not hasattr(self.encoder, 'num_register_tokens'):
+            self.encoder.num_register_tokens = 0
+        self.mask_neighbor_size = mask_neighbor_size
+
+    def forward(self, x):
+        x = self.encoder.prepare_tokens(x)
+        en_list = []
+        for i, blk in enumerate(self.encoder.blocks):
+            if i <= self.target_layers[-1]:
+                with torch.no_grad():
+                    x = blk(x)
+            else:
+                continue
+            if i in self.target_layers:
+                en_list.append(x)
+        side = int(math.sqrt(en_list[0].shape[1] - 1 - self.encoder.num_register_tokens))
+
+        if self.remove_class_token:
+            en_list = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en_list]
+            x = x[:, 1 + self.encoder.num_register_tokens:, :]
+
+        for i, blk in enumerate(self.bottleneck):
+            x = blk(x)
+
+        if self.mask_neighbor_size > 0:
+            attn_mask = self.generate_mask(side, x.device)
+        else:
+            attn_mask = None
+
+        de_list = []
+        for i, blk in enumerate(self.decoder):
+            x = blk(x, attn_mask=attn_mask)
+            de_list.append(x)
+        de_list = de_list[::-1]
+
+        en = [en_list[idx] for idx in self.fuse_layer_encoder]
+        de = [de_list[idx] for idx in self.fuse_layer_decoder]
+
+        if not self.remove_class_token:
+            en = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en]
+            de = [d[:, 1 + self.encoder.num_register_tokens:, :] for d in de]
+
+        en = [e.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for e in en]
+        de = [d.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for d in de]
+        return en, de
+
+    def generate_mask(self, feature_size, device='cuda'):
+        h, w = feature_size, feature_size
+        hm, wm = self.mask_neighbor_size, self.mask_neighbor_size
+        mask = torch.ones(h, w, h, w, device=device)
+        for idx_h1 in range(h):
+            for idx_w1 in range(w):
+                idx_h2_start = max(idx_h1 - hm // 2, 0)
+                idx_h2_end = min(idx_h1 + hm // 2 + 1, h)
+                idx_w2_start = max(idx_w1 - wm // 2, 0)
+                idx_w2_end = min(idx_w1 + wm // 2 + 1, w)
+                mask[
+                idx_h1, idx_w1, idx_h2_start:idx_h2_end, idx_w2_start:idx_w2_end
+                ] = 0
+        mask = mask.view(h * w, h * w)
+        if self.remove_class_token:
+            return mask
+        mask_all = torch.ones(h * w + 1 + self.encoder.num_register_tokens,
+                              h * w + 1 + self.encoder.num_register_tokens, device=device)
+        mask_all[1 + self.encoder.num_register_tokens:, 1 + self.encoder.num_register_tokens:] = mask
+        return mask_all
+
+
+class ViTillv2(nn.Module):
+    def __init__(
+            self,
+            encoder,
+            bottleneck,
+            decoder,
+            target_layers=[2, 3, 4, 5, 6, 7]
+    ) -> None:
+        super(ViTillv2, self).__init__()
+        self.encoder = encoder
+        self.bottleneck = bottleneck
+        self.decoder = decoder
+        self.target_layers = target_layers
+        if not hasattr(self.encoder, 'num_register_tokens'):
+            self.encoder.num_register_tokens = 0
+
+    def forward(self, x):
+        x = self.encoder.prepare_tokens(x)
+        en = []
+        for i, blk in enumerate(self.encoder.blocks):
+            if i <= self.target_layers[-1]:
+                with torch.no_grad():
+                    x = blk(x)
+            else:
+                continue
+            if i in self.target_layers:
+                en.append(x)
+
+        x = self.fuse_feature(en)
+        for i, blk in enumerate(self.bottleneck):
+            x = blk(x)
+
+        de = []
+        for i, blk in enumerate(self.decoder):
+            x = blk(x)
+            de.append(x)
+
+        side = int(math.sqrt(x.shape[1]))
+
+        en = [e[:, self.encoder.num_register_tokens + 1:, :] for e in en]
+        de = [d[:, self.encoder.num_register_tokens + 1:, :] for d in de]
+
+        en = [e.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for e in en]
+        de = [d.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for d in de]
+
+        return en[::-1], de
+
+    def fuse_feature(self, feat_list):
+        return torch.stack(feat_list, dim=1).mean(dim=1)
+
+
+class ViTillv3(nn.Module):
+    def __init__(
+            self,
+            teacher,
+            student,
+            target_layers=[2, 3, 4, 5, 6, 7, 8, 9],
+            fuse_dropout=0.,
+    ) -> None:
+        super(ViTillv3, self).__init__()
+        self.teacher = teacher
+        self.student = student
+        if fuse_dropout > 0:
+            self.fuse_dropout = nn.Dropout(fuse_dropout)
+        else:
+            self.fuse_dropout = nn.Identity()
+        self.target_layers = target_layers
+        if not hasattr(self.teacher, 'num_register_tokens'):
+            self.teacher.num_register_tokens = 0
+
+    def forward(self, x):
+        with torch.no_grad():
+            patch = self.teacher.prepare_tokens(x)
+            x = patch
+            en = []
+            for i, blk in enumerate(self.teacher.blocks):
+                if i <= self.target_layers[-1]:
+                    x = blk(x)
+                else:
+                    continue
+                if i in self.target_layers:
+                    en.append(x)
+            en = self.fuse_feature(en, fuse_dropout=False)
+
+        x = patch
+        de = []
+        for i, blk in enumerate(self.student):
+            x = blk(x)
+            if i in self.target_layers:
+                de.append(x)
+        de = self.fuse_feature(de, fuse_dropout=False)
+
+        en = en[:, 1 + self.teacher.num_register_tokens:, :]
+        de = de[:, 1 + self.teacher.num_register_tokens:, :]
+        side = int(math.sqrt(en.shape[1]))
+
+        en = en.permute(0, 2, 1).reshape([x.shape[0], -1, side, side])
+        de = de.permute(0, 2, 1).reshape([x.shape[0], -1, side, side])
+        return [en.contiguous()], [de.contiguous()]
+
+    def fuse_feature(self, feat_list, fuse_dropout=False):
+        if fuse_dropout:
+            feat = torch.stack(feat_list, dim=1)
+            feat = self.fuse_dropout(feat).mean(dim=1)
+            return feat
+        else:
+            return torch.stack(feat_list, dim=1).mean(dim=1)
+
+
+class ReContrast(nn.Module):
+    def __init__(
+            self,
+            encoder,
+            encoder_freeze,
+            bottleneck,
+            decoder,
+    ) -> None:
+        super(ReContrast, self).__init__()
+        self.encoder = encoder
+        self.encoder.layer4 = None
+        self.encoder.fc = None
+
+        self.encoder_freeze = encoder_freeze
+        self.encoder_freeze.layer4 = None
+        self.encoder_freeze.fc = None
+
+        self.bottleneck = bottleneck
+        self.decoder = decoder
+
+    def forward(self, x):
+        en = self.encoder(x)
+        with torch.no_grad():
+            en_freeze = self.encoder_freeze(x)
+        en_2 = [torch.cat([a, b], dim=0) for a, b in zip(en, en_freeze)]
+        de = self.decoder(self.bottleneck(en_2))
+        de = [a.chunk(dim=0, chunks=2) for a in de]
+        de = [de[0][0], de[1][0], de[2][0], de[3][1], de[4][1], de[5][1]]
+        return en_freeze + en, de
+
+    def train(self, mode=True, encoder_bn_train=True):
+        self.training = mode
+        if mode is True:
+            if encoder_bn_train:
+                self.encoder.train(True)
+            else:
+                self.encoder.train(False)
+            self.encoder_freeze.train(False)
+            self.bottleneck.train(True)
+            self.decoder.train(True)
+        else:
+            self.encoder.train(False)
+            self.encoder_freeze.train(False)
+            self.bottleneck.train(False)
+            self.decoder.train(False)
+        return self
+
+
+def update_moving_average(ma_model, current_model, momentum=0.99):
+    for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+        old_weight, up_weight = ma_params.data, current_params.data
+        ma_params.data = update_average(old_weight, up_weight)
+
+    for current_buffers, ma_buffers in zip(current_model.buffers(), ma_model.buffers()):
+        old_buffer, up_buffer = ma_buffers.data, current_buffers.data
+        ma_buffers.data = update_average(old_buffer, up_buffer, momentum)
+
+
+def update_average(old, new, momentum=0.99):
+    if old is None:
+        return new
+    return old * momentum + (1 - momentum) * new
+
+
+def disable_running_stats(model):
+    def _disable(module):
+        if isinstance(module, _BatchNorm):
+            module.backup_momentum = module.momentum
+            module.momentum = 0
+
+    model.apply(_disable)
+
+
+def enable_running_stats(model):
+    def _enable(module):
+        if isinstance(module, _BatchNorm) and hasattr(module, "backup_momentum"):
+            module.momentum = module.backup_momentum
+
+    model.apply(_enable)
+
+
+class DualPathViTill(nn.Module):
+    """
+    双支路异常检测模型：
+    - 局部支路：CNN处理局部细节特征
+    - 全局支路：MANBA（Modified Attention-based Architecture）处理全局上下文
+    """
+    def __init__(
+            self,
+            encoder,
+            bottleneck,
+            decoder,
+            target_layers=[2, 3, 4, 5, 6, 7, 8, 9],
+            fuse_layer_encoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
+            fuse_layer_decoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
+            mask_neighbor_size=0,
+            remove_class_token=False,
+            encoder_require_grad_layer=[],
+            cnn_channels=64,
+            manba_heads=8
+    ) -> None:
+        super(DualPathViTill, self).__init__()
+        self.encoder = encoder
+        self.bottleneck = bottleneck
+        self.decoder = decoder
+        self.target_layers = target_layers
+        self.fuse_layer_encoder = fuse_layer_encoder
+        self.fuse_layer_decoder = fuse_layer_decoder
+        self.remove_class_token = remove_class_token
+        self.encoder_require_grad_layer = encoder_require_grad_layer
+        self.mask_neighbor_size = mask_neighbor_size
+
+        if not hasattr(self.encoder, 'num_register_tokens'):
+            self.encoder.num_register_tokens = 0
+
+        # 局部CNN支路
+        self.local_cnn = nn.Sequential(
+            nn.Conv2d(3, cnn_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(cnn_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(cnn_channels),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((14, 14))
+        )
+
+        # 全局MANBA支路
+        self.manba_adapter = nn.Sequential(
+            nn.Linear(768, 512),
+            nn.LayerNorm(512),
+            nn.GELU()
+        )
+
+        # 自适应融合权重
+        self.fusion_weight = nn.Parameter(torch.tensor(0.5))
+
+        # 特征融合模块
+        self.feature_fusion = nn.Sequential(
+            nn.Conv2d(cnn_channels + 512, 768, kernel_size=1),
+            nn.BatchNorm2d(768),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        B = x.shape[0]
+        
+        # ========== 调试打印 ==========
+
+        
+        # ========== 局部CNN支路处理 ==========
+        local_features = self.local_cnn(x)
+
+        
+        # ========== 全局MANBA支路处理 ==========
+        x_tokens = self.encoder.prepare_tokens(x)
+        en_list = []
+        for i, blk in enumerate(self.encoder.blocks):
+            if i <= self.target_layers[-1]:
+                if i in self.encoder_require_grad_layer:
+                    x_tokens = blk(x_tokens)
+                else:
+                    with torch.no_grad():
+                        x_tokens = blk(x_tokens)
+            else:
+                continue
+            if i in self.target_layers:
+                en_list.append(x_tokens)
+
+        
+        total_tokens = en_list[0].shape[1]
+        num_special_tokens = 1 + self.encoder.num_register_tokens
+        num_patch_tokens = total_tokens - num_special_tokens
+        side = int(math.sqrt(num_patch_tokens))
+        
+        if self.remove_class_token:
+            en_list = [e[:, num_special_tokens:, :] for e in en_list]
+
+        global_features = self.fuse_feature(en_list)
+        global_features = self.manba_adapter(global_features)
+        
+        B_tokens, N, C = global_features.shape
+        
+        expected_N = side * side
+        if N != expected_N:
+            if N > expected_N:
+                global_features = global_features[:, :expected_N, :]
+            else:
+                padding = torch.zeros(B_tokens, expected_N - N, C, device=global_features.device)
+                global_features = torch.cat([global_features, padding], dim=1)
+            N = expected_N
+        
+        global_features_spatial = global_features.permute(0, 2, 1).reshape(B_tokens, C, side, side)
+
+        if side != 14:
+            global_features_spatial = F.interpolate(
+                global_features_spatial, size=(14, 14), mode='bilinear', align_corners=False
+            )
+        
+        # ========== 自适应融合 ==========
+        alpha = torch.sigmoid(self.fusion_weight)
+        fused_features = torch.cat([local_features, global_features_spatial], dim=1)
+        fused_features = self.feature_fusion(fused_features)
+
+        
+        B_fused, C_fused, H_fused, W_fused = fused_features.shape
+        fused_tokens = fused_features.reshape(B_fused, C_fused, H_fused * W_fused).permute(0, 2, 1)
+        
+        cls_token = fused_tokens.mean(dim=1, keepdim=True)
+        fused_tokens = torch.cat([cls_token, fused_tokens], dim=1)
+        
+        # ========== 瓶颈层处理 ==========
+        for i, blk in enumerate(self.bottleneck):
+            fused_tokens = blk(fused_tokens)
+
+        # ========== 解码器处理 ==========
+        if self.mask_neighbor_size > 0:
+            attn_mask = self.generate_mask(H_fused, fused_tokens.device)
+        else:
+            attn_mask = None
+
+        de_list = []
+        for i, blk in enumerate(self.decoder):
+            fused_tokens = blk(fused_tokens, attn_mask=attn_mask)
+            de_list.append(fused_tokens)
+        de_list = de_list[::-1]
+
+        en_output = [fused_features]
+        de_output = []
+        for d in de_list:
+            d_spatial = d[:, 1:, :].permute(0, 2, 1).reshape(B_fused, -1, H_fused, W_fused)
+            de_output.append(d_spatial)
+
+        
+        return en_output, de_output
+
+    def fuse_feature(self, feat_list):
+        return torch.stack(feat_list, dim=1).mean(dim=1)
+
+    def generate_mask(self, feature_size, device='cuda'):
+        h, w = feature_size, feature_size
+        hm, wm = self.mask_neighbor_size, self.mask_neighbor_size
+        mask = torch.ones(h, w, h, w, device=device)
+        for idx_h1 in range(h):
+            for idx_w1 in range(w):
+                idx_h2_start = max(idx_h1 - hm // 2, 0)
+                idx_h2_end = min(idx_h1 + hm // 2 + 1, h)
+                idx_w2_start = max(idx_w1 - wm // 2, 0)
+                idx_w2_end = min(idx_w1 + wm // 2 + 1, w)
+                mask[
+                idx_h1, idx_w1, idx_h2_start:idx_h2_end, idx_w2_start:idx_w2_end
+                ] = 0
+        mask = mask.view(h * w, h * w)
+        if self.remove_class_token:
+            return mask
+        mask_all = torch.ones(h * w + 1 + self.encoder.num_register_tokens,
+                              h * w + 1 + self.encoder.num_register_tokens, device=device)
+        mask_all[1 + self.encoder.num_register_tokens:, 1 + self.encoder.num_register_tokens:] = mask
+        return mask_all
+      
+# ---------------- ✨ 创新点：局部感知卷积适配器 ✨ ----------------
+class LocalAwareAdapter(nn.Module):
+    def __init__(self, dim=768, reduction=4):
+        super().__init__()
+        # 1. 降维，极其省显存
+        self.down = nn.Linear(dim, dim // reduction)
+        
+        # 2. 核心魔法：3x3 深度可分离卷积，像显微镜一样看划痕，且参数量极小
+        self.conv = nn.Conv2d(
+            dim // reduction, dim // reduction, 
+            kernel_size=3, padding=1, groups=dim // reduction
+        )
+        
+        # 3. 升维，恢复到原来的维度
+        self.up = nn.Linear(dim // reduction, dim)
+        self.act = nn.GELU()
+        
+        # 🌟 绝对保底机制：初始化为0！
+        # 这意味着第一轮训练时，Adapter完全隐形，模型等于纯SAM。
+        # 随着训练，它会自动学会应该给划痕分配多大的权重。
+        self.scale = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, H, W):
+        residual = x
+        x = self.down(x)
+        # 将序列拉成图像 [B, C, H, W]，让卷积核能扫描相邻像素
+        x = x.permute(0, 2, 1).reshape(x.shape[0], -1, H, W)
+        x = self.act(self.conv(x))
+        # 压扁回序列 [B, H*W, C]
+        x = x.flatten(2).permute(0, 2, 1)
+        x = self.up(x)
+        return residual + x * self.scale
+
+
+
+class FFTAdapter(nn.Module):
+    def __init__(self, dim=768):
+        super().__init__()
+        # 初始阀门，让网络慢慢学习融合高频特征
+        self.gamma = nn.Parameter(torch.tensor([0.01]))
+
+    def forward(self, x_fused, H, W):
+        # 接收 SAM 吐出来的融合特征 (B, N, C)
+        B, N, C = x_fused.shape
+        
+        # 变回二维空间特征图 (B, C, H, W)
+        spatial_img = x_fused.transpose(1, 2).reshape(B, C, H, W).float()
+        
+        # --- 降维打击：进入频域 ---
+        fft_feat = torch.fft.fft2(spatial_img)
+        fft_shifted = torch.fft.fftshift(fft_feat, dim=(-2, -1)) 
+        
+        # --- 构造低频黑洞掩码 ---
+        mask = torch.ones_like(fft_shifted.real)
+        center_h, center_w = H // 2, W // 2
+        radius = 2.0 
+        
+        Y, X = torch.meshgrid(torch.arange(H, device=x_fused.device), torch.arange(W, device=x_fused.device), indexing='ij')
+        dist = (Y - center_h)**2 + (X - center_w)**2
+        mask[..., dist <= radius**2] = 0.0 # 抹杀低频宏观背景
+        
+        # --- 频域劫持与重构 ---
+        fft_hijacked = fft_shifted * mask
+        fft_ishifted = torch.fft.ifftshift(fft_hijacked, dim=(-2, -1))
+        high_freq_img = torch.fft.ifft2(fft_ishifted).real 
+        
+        # 变回序列格式 (B, N, C)
+        high_freq_seq = high_freq_img.flatten(2).transpose(1, 2)
+        
+        # ⚡ 完美融合：完美语义 + 极限高频划痕！
+        return x_fused + self.gamma * high_freq_seq
+class RealDefectInjector(nn.Module):
+    def __init__(self, embed_dim=768, num_defects=10):
+        super().__init__()
+        # 这就是你心心念念的“中间权重 W”的存放仓库！
+        # 我们建一个包含了 num_defects 个真实残差的字典 (Delta Dictionary)
+        # 初始阶段给一点点微小的高斯噪声占位，后续可以通过验证集真实特征来覆盖它
+        self.defect_dictionary = nn.Parameter(torch.randn(num_defects, 1, embed_dim) * 0.02)
+        
+        # 训练时，有 50% 的概率给正常图片“下毒”（注入划痕特征）
+        self.inject_prob = 0.5 
+
+    def forward(self, x):
+        # 只有在训练阶段才进行“加减乘除”的造假，测试阶段原样输出！
+        if self.training and random.random() < self.inject_prob:
+            B, N, C = x.shape
+            
+            # 1. 从字典里随机抽一根“划痕权重 W”
+            idx = random.randint(0, self.defect_dictionary.size(0) - 1)
+            defect_w = self.defect_dictionary[idx] # (1, C)
+            
+            # 2. 划痕是局部的，所以我们随机挑大约 5% 的空间位置注入异常
+            # mask 就是用来控制划痕大小的
+            mask = (torch.rand(B, N, 1, device=x.device) < 0.05).float() 
+            defect_scale = 2.5 
+            x = x + (defect_w * defect_scale) * mask
+            
+        return x
+    # def forward(self, x, label=None):
+    #     if self.training and random.random() < self.inject_prob:
+    #         B, N, C = x.shape
+    #         side = int(math.sqrt(N))
+            
+    #         # 🔪 步骤一：高频划痕注入 (全类别通用，保护 PDE 引擎基本盘)
+    #         idx = random.randint(0, self.defect_dictionary.size(0) - 1)
+    #         defect_w = self.defect_dictionary[idx]
+    #         mask = (torch.rand(B, N, 1, device=x.device) < 0.05).float() 
+    #         defect_scale = 2.5 
+    #         x = x + (defect_w * defect_scale) * mask
+            
+    #         # 🪚 步骤二：精确制导的端点截断 (彻底抛弃容易出错的矩阵广播，改用绝对精度的 for 循环)
+    #         if label is not None:
+    #             x_2d = x.transpose(1, 2).view(B, C, side, side)
+                
+    #             # 🌟 修复：独立遍历 Batch 中的每一张图
+    #             # 确保每一颗螺丝的触发概率、切断方向都是绝对独立的！
+    #             for b in range(B):
+    #                 # 只锁定 screw (11) 并且拥有独立的 50% 触发概率
+    #                 if label[b] == 11 and random.random() < 0.5:
+    #                     direction = random.randint(0, 3)
+    #                     # 截断比例：15% ~ 30%
+    #                     cutoff = int(side * random.uniform(0.15, 0.30)) 
+                        
+    #                     # 🌟 修复：取边缘 2 行/列 的特征求均值，比单行更平滑、更稳定
+    #                     if direction == 0:   # 砍头 (Top)
+    #                         bg_mean = x_2d[b, :, 0:2, :].mean(dim=(1, 2), keepdim=True) 
+    #                         x_2d[b, :, :cutoff, :] = bg_mean
+    #                     elif direction == 1: # 砍尾 (Bottom)
+    #                         bg_mean = x_2d[b, :, -2:, :].mean(dim=(1, 2), keepdim=True)
+    #                         x_2d[b, :, -cutoff:, :] = bg_mean
+    #                     elif direction == 2: # 砍左侧 (Left)
+    #                         bg_mean = x_2d[b, :, :, 0:2].mean(dim=(1, 2), keepdim=True)
+    #                         x_2d[b, :, :, :cutoff] = bg_mean
+    #                     else:                # 砍右侧 (Right)
+    #                         bg_mean = x_2d[b, :, :, -2:].mean(dim=(1, 2), keepdim=True)
+    #                         x_2d[b, :, :, -cutoff:] = bg_mean
+                
+    #             # 将处理后的 2D 特征重新展平回 1D 序列
+    #             x = x_2d.view(B, C, N).transpose(1, 2)
+                    
+    #     return x
+class PDEEvolutionLayer(nn.Module):
+    def __init__(self, channels=768, dt=0.05, steps=5, source_weight=0.03):
+        super().__init__()
+        self.dt = dt
+        self.steps = steps
+        self.source_weight = source_weight
+        
+        # 传导系数生成器：网络自己学习正常金属的热传导规律
+        self.conduction_net = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.Sigmoid() # 限制传导率在 0~1 之间
+        )
+        
+        # 离散化拉普拉斯算子 (计算空间二阶导数)
+        # 用 register_buffer 保证它跟着模型自动去 GPU，不需要梯度
+        laplacian_kernel = torch.tensor([[[[0., 1., 0.],
+                                           [1., -4., 1.],
+                                           [0., 1., 0.]]]])
+        self.register_buffer('laplacian_kernel', laplacian_kernel.repeat(channels, 1, 1, 1))
+
+    def forward(self, x_seq, side, source_seq=None):
+        # 1. 进来的是序列 (B, N, C)，我们需要把它铺平成物理空间的二维特征图 (B, C, H, W)
+        B, N, C = x_seq.shape
+        x = x_seq.transpose(1, 2).reshape(B, C, side, side)
+
+        # 非齐次源项：默认使用初始特征的局部高频残差作为等效源项，
+        # 在每个 PDE step 中持续注入，避免仅把扰动作为初始条件。
+        if source_seq is None:
+            source = F.conv2d(x, self.laplacian_kernel, padding=1, groups=C).detach()
+        else:
+            source = source_seq.transpose(1, 2).reshape(B, C, side, side).detach()
+        
+        # 2. 让特征在时间轴上推演 steps 步
+        for _ in range(self.steps):
+            # 预测正常流形的传导系数
+            c = self.conduction_net(x)
+            
+            # 计算特征的空间拉普拉斯 (利用深度可分离卷积，极其高效)
+            del_x = F.conv2d(x, self.laplacian_kernel, padding=1, groups=C)
+            
+            # 非齐次前向欧拉演化：扩散项 + 残差源项
+            x = x + self.dt * (c * del_x + self.source_weight * source)
+            
+        # 3. 演化结束，把崩塌后的特征重新抽成序列 (B, N, C) 还给网络
+        x_seq_evolved = x.flatten(2).transpose(1, 2)
+        return x_seq_evolved
+        
+class PDEResidualBottleneck(nn.Module): 
+    def __init__(self, pde_layer):
+        """
+        潜空间 \Delta F 残差零延迟注入层
+        """
+        super().__init__()
+        self.pde_layer = pde_layer
+        self.gamma = nn.Parameter(torch.zeros(1)) 
+
+    def forward(self, x, side):
+        # 1. 偏微分演化：计算基底特征 (透传 side 参数以维持空间维度)
+        x_pde = self.pde_layer(x, side)
+        
+        # 2. 激波捕获：剥离高频异常 (\Delta F)
+        delta_f = x - x_pde
+        
+        # 3. 零延迟非对称注入
+        out = x_pde + self.gamma * delta_f
+        
+        return out
+
+    def residual_energy(self, x, side):
+        x_pde = self.pde_layer(x, side)
+        delta_f = x - x_pde
+        return delta_f.pow(2).mean(dim=(1, 2)).sqrt()
+
+    def residual_metrics(self, x, side):
+        x_pde = self.pde_layer(x, side)
+        delta_f = x - x_pde
+
+        residual_energy = delta_f.pow(2).mean(dim=(1, 2)).sqrt()
+        pde_flat = x_pde.flatten(1)
+        residual_flat = delta_f.flatten(1)
+        orthogonality = F.cosine_similarity(pde_flat, residual_flat, dim=1).abs()
+
+        B, N, C = delta_f.shape
+        residual_map = delta_f.pow(2).mean(dim=2).reshape(B, side * side)
+        sorted_energy = torch.sort(residual_map, dim=1, descending=True)[0]
+        k = max(1, int(sorted_energy.shape[1] * 0.01))
+        concentration = sorted_energy[:, :k].mean(dim=1) / (residual_map.mean(dim=1) + 1e-6)
+
+        return torch.stack([residual_energy, orthogonality, concentration], dim=1)
+
+    def residual_map(self, x, side):
+        x_pde = self.pde_layer(x, side)
+        delta_f = x - x_pde
+        residual_map = delta_f.pow(2).mean(dim=2).reshape(x.shape[0], 1, side, side)
+        return residual_map
+# class PDEResidualBottleneck(nn.Module):
+#     def __init__(self, pde_layer, embed_dim=768):
+#         super().__init__()
+#         self.pde_layer = pde_layer
+        
+#         # ==========================================
+#         # 🌟 创新升级：分布感知自适应硬挖掘参数
+#         # 从全局标量 (1) 升级为通道级向量 (1, 1, 768)
+#         # 网络将自动学习哪些通道是纹理通道（抑制残差），哪些是激波通道（放大残差）
+#         # ==========================================
+#         self.gamma = nn.Parameter(torch.zeros(1, 1, embed_dim)) 
+
+#     def forward(self, x, side):
+#         # 提取基底
+#         x_pde = self.pde_layer(x, side)
+#         # 提取残差
+#         delta_f = x - x_pde
+        
+#         # 零延迟非对称通道级注入 (利用广播机制，保持极速推理)
+#         out = x_pde + self.gamma * delta_f
+        
+#         ortho_loss = torch.tensor(0.0, device=x.device)
+#         if self.training:
+#             # 正交约束依然保留，但配合通道级的 gamma，网络有了更大的自由度来寻找解耦平衡
+#             cos_sim = F.cosine_similarity(x_pde.flatten(1), delta_f.flatten(1), dim=1)
+#             ortho_loss = cos_sim.abs().mean()
+            
+#         return out, ortho_loss
+# ==========================================
+# 🌟 新增：特征扩散防线 (低通物理滤波器)
+# ==========================================
+class FeatureDiffusionAdapter(nn.Module):
+    def __init__(self, dim=768, kernel_size=5):
+        super().__init__()
+        # 深度空间均值池化，数学上等价于热传导方程的前向欧拉扩散步
+        self.blur = nn.Sequential(
+            nn.ReflectionPad2d(kernel_size // 2),
+            nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, groups=dim, bias=False)
+        )
+        # 初始化权重为均匀分布
+        nn.init.constant_(self.blur[1].weight, 1.0 / (kernel_size * kernel_size))
+        self.blur[1].weight.requires_grad = False # 锁定为纯物理扩散算子
+        
+        # 智能温控开关：初始为 -4.0 (关闭状态)，让网络自己决定是否开启
+        self.alpha = nn.Parameter(torch.ones(1, dim, 1, 1) * -4.0) 
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        x_2d = x.transpose(1, 2).view(B, C, H, W)
+        
+        # 计算物理扩散流
+        x_blurred = self.blur(x_2d)
+        
+        # 动态热流融合：保留高频真实缺陷，滤除背景杂波
+        x_2d = x_2d + torch.sigmoid(self.alpha) * (x_blurred - x_2d)
+        
+        return x_2d.view(B, C, -1).transpose(1, 2)
+# class FeatureDiffusionAdapter(nn.Module):
+#     def __init__(self, dim=768):
+#         super().__init__()
+#         # 边缘保护门控：只有在梯度（边缘）较弱的地方才平滑
+#         self.alpha = nn.Parameter(torch.ones(1, dim, 1, 1) * -4.0) 
+
+#     def forward(self, x, H, W):
+#         B, N, C = x.shape
+#         x_2d = x.transpose(1, 2).view(B, C, H, W)
+        
+#         # 计算局部梯度 (利用简单的差分捕捉边缘)
+#         grad_x = torch.abs(x_2d[:, :, :, 1:] - x_2d[:, :, :, :-1])
+#         grad_y = torch.abs(x_2d[:, :, 1:, :] - x_2d[:, :, :-1, :])
+        
+#         # 边缘权重 (越大越不平滑)
+#         edge_mask = torch.exp(- (grad_x.mean(dim=1, keepdim=True).mean(dim=3, keepdim=True) + 
+#                                  grad_y.mean(dim=1, keepdim=True).mean(dim=2, keepdim=True)))
+        
+#         # 简单的平滑算子 (均值)
+#         x_blurred = F.avg_pool2d(x_2d, 3, 1, 1)
+        
+#         # 只在 edge_mask 小的地方（即非边缘区域）平滑
+#         x_2d = x_2d + torch.sigmoid(self.alpha) * edge_mask * (x_blurred - x_2d)
+        
+#         return x_2d.view(B, C, -1).transpose(1, 2)

@@ -1,0 +1,38 @@
+def forward(self, x):
+        B, C, H, W = x.shape
+        x_sam = F.interpolate(x, size=(1024, 1024), mode='bilinear', align_corners=False)
+        
+        layer_features = []
+        # 我们只选 3 层：第 4, 8, 12 块 (索引为 3, 7, 11)
+        select_layers = [3, 7, 11] 
+        
+        with torch.no_grad():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                feat = self.image_encoder.patch_embed(x_sam)
+                if self.image_encoder.pos_embed is not None:
+                    feat = feat + self.image_encoder.pos_embed
+
+                for i, blk in enumerate(self.image_encoder.blocks):
+                    feat = blk(feat)
+                    if i in select_layers:
+                        # 转换并添加。确保这里只针对 select_layers 执行
+                        p_feat = feat.permute(0, 3, 1, 2).contiguous()
+                        layer_features.append(p_feat)
+                
+                # 在这里加一个打印确认，看看 cat 之前到底有几层
+                # print(f"DEBUG: Number of layers to cat = {len(layer_features)}") 
+                
+                # 拼接：3层 * 256 = 768
+                multi_feat = torch.cat(layer_features, dim=1)
+                
+        multi_feat = multi_feat.float()
+        
+        # 此时 multi_feat 的通道数应该是 768
+        target_H, target_W = H // 16, W // 16
+        multi_feat = F.interpolate(multi_feat, size=(target_H, target_W), mode='bilinear', align_corners=False)
+        
+        # 此时 adapter 的 in_channels 是 768，输入也是 768，完美匹配
+        out = self.adapter(multi_feat) 
+        
+        out = out.flatten(2).transpose(1, 2) 
+        return (out, )

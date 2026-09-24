@@ -1,0 +1,6 @@
+python dinomaly_mvtec_uni.py --data_path /root/autodl-tmp/MVTecAD/data/mvtec
+python dinomaly_visa_uni.py --data_path /root/autodl-tmp/VisA_pytorch/1cls
+python dinomaly_btad_uni.py --data_path /root/autodl-tmp/btad/BTech
+python dinomaly_mpdd_uni.py --data_path /root/autodl-tmp/mpdd
+python dinomaly_realiad_uni.py 
+python dinomaly_mvtec_uni.py --data_path /root/autodl-tmp/MVTecAD/data/mvtec && python dinomaly_visa_uni.py --data_path /root/autodl-tmp/VisA_pytorch/1cls && python dinomaly_btad_uni.py --data_path /root/autodl-tmp/btad/BTech && python dinomaly_mpdd_uni.py --data_path /root/autodl-tmp/mpdd
